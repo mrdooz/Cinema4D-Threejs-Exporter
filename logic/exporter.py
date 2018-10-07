@@ -7,15 +7,83 @@ import shutil
 import c4d
 import math
 import ctypes
+import struct
 
 from logic import ids
 from collections import defaultdict, OrderedDict
 from c4d import documents, UVWTag, storage, plugins, gui, modules, bitmaps, utils
 from c4d.utils import *
 
+class BufferedStruct():
+	def __init__(self, initial_size = 32 * 1024):
+		self.buf_size = 32
+		self.buf = ctypes.create_string_buffer(self.buf_size)
+		self.bytes_used = 0
+
+	def pack(self, fmt, *args):
+		req_size = struct.calcsize(fmt)
+		bytes_left = self.buf_size - self.bytes_used
+		if req_size > bytes_left:
+			# realloc a new buffer
+			new_size = int(max(1.5 * self.buf_size, self.bytes_used + req_size))
+			new_buf = ctypes.create_string_buffer(new_size)
+			ctypes.memmove(new_buf, self.buf, self.bytes_used)
+			self.buf = new_buf
+			self.buf_size = new_size
+
+		struct.pack_into(fmt, self.buf, self.bytes_used, *args)
+		self.bytes_used += req_size
+
+class ChunkWriter():
+	def __init__(self):
+		self.buf = BufferedStruct()
+		self.chunk_stack = []	# save entry points
+
+	def enter(self, tag):
+		self.chunk_stack.append(self.buf.bytes_used)
+		self.buf.pack("ccccI", tag[0], tag[1], tag[2], tag[3], 0)
+
+	def leave(self):
+		# update the chunk size in the header
+		chunk_start = self.chunk_stack.pop()
+		chunk_size = self.buf.bytes_used - chunk_start - 8
+		struct.pack_into("I", self.buf.buf, chunk_start + 4, chunk_size)
+
+	def write(self, filename):
+		# create a trimmed buffer
+		trimmed = ctypes.create_string_buffer(self.buf.bytes_used)
+		ctypes.memmove(trimmed, self.buf.buf, self.buf.bytes_used)
+		print ("bytes used: %d" % (self.buf.bytes_used))
+		with file(filename, 'wb') as f:
+			f.write(trimmed)
+
+	def pack(self, fmt, *args):
+		self.buf.pack(fmt, *args)
+
+	def pack_string(self, s):
+		# save string as null terminated
+		# write len and data
+		strlen = len(s)
+		self.pack(('%ds' % strlen), s)
+		self.pack('b', 0)
+
+class Chunk():
+	def __init__(self, writer, tag):
+		self.writer = writer
+		self.tag = tag
+
+	def __enter__(self):
+		self.writer.enter(self.tag)
+
+	def __exit__(self, type, value, traceback):
+		self.writer.leave()
+
+
 class ThreeJsWriter(object):
 
 	def write(self, dialog):
+
+		# org
 
 		self.output = OrderedDict()
 		self.dialog = dialog
@@ -65,122 +133,139 @@ class ThreeJsWriter(object):
 			'generatedBy': 'Cinema 4D Exporter ' + self.dialog.VERSION
 		}
 
-		# Mesh export
-		if self.dialog.GetBool(ids.TRIANGULATE) == True:
-			c4d.utils.SendModelingCommand(c4d.MCOMMAND_TRIANGULATE, [self.mesh])
-			# Get updated uv and weight tags from the clone
-			for tag in self.mesh.GetTags():
-				if tag.GetType() == 5671: # UVW
-					self.dialog.uvtag = tag
-					self.uvtag = tag
-				if tag.GetType() == 1019365: # Weight
-					self.dialog.weighttag = tag
-					self.weighttag = tag
-			print '✓     Mesh triangulated'
+		writer = ChunkWriter()
+		with Chunk(writer, 'BB3D'):
+			with Chunk(writer, 'NODE'):
+				writer.pack_string(self.mesh.GetName())
 
-		if self.dialog.GetBool(ids.PHONG) == True:
-			c4d.utils.SendModelingCommand(c4d.MCOMMAND_BREAKPHONG, [self.mesh])
-			print '✓     Phong break done'
+				pos = self.mesh.GetMg().off	
+				rot = self.mesh.GetRelRot()
+				rotq = c4d.Quaternion()
+				rotq.SetHPB(rot)
+				scl = self.mesh.GetRelScale()
 
-		if self.dialog.GetBool(ids.VERTICES):
-			self._exportVertices()
-			if self.vertices: self.output['vertices'] = self.vertices
-			print '✓     Vertices exported'
+				writer.pack('fff', pos.x, pos.y, pos.z)
+				writer.pack('ffff', rotq.w, rotq.v.x, rotq.v.y, rotq.v.z)
+				writer.pack('fff', scl.x, scl.y, scl.z)
 
-		if self.dialog.GetBool(ids.NORMALSFACE):
-			self._exportFaceNormals()
-			if self.normals: self.output['normals'] = self.normals
-			print '✓     Face normals exported'
 
-		if self.dialog.GetBool(ids.NORMALSVERTEX):
-			self._exportVertexNormals()
-			if self.normals: self.output['normals'] = self.normals
-			print '✓     Vertex normals exported'
+				# Mesh export
+				if self.dialog.GetBool(ids.TRIANGULATE) == True:
+					c4d.utils.SendModelingCommand(c4d.MCOMMAND_TRIANGULATE, [self.mesh])
+					# Get updated uv and weight tags from the clone
+					for tag in self.mesh.GetTags():
+						if tag.GetType() == 5671: # UVW
+							self.dialog.uvtag = tag
+							self.uvtag = tag
+						if tag.GetType() == 1019365: # Weight
+							self.dialog.weighttag = tag
+							self.weighttag = tag
+					print '✓     Mesh triangulated'
 
-		if self.dialog.GetBool(ids.UVS):
-			if dialog.uvtag:
-				self._exportFaceVertexUVs(dialog.uvtag)
-				if self.uvs: self.output['uvs'] = [self.uvs]
-				print '✓     UVs exported'
+				if self.dialog.GetBool(ids.PHONG) == True:
+					c4d.utils.SendModelingCommand(c4d.MCOMMAND_BREAKPHONG, [self.mesh])
+					print '✓     Phong break done'
 
-		if self.dialog.GetBool(ids.FACES):
-			self._exportFaces()
-			if self.faces: self.output['faces'] = self.faces
-			print "✓     Faces exported"
+				if self.dialog.GetBool(ids.VERTICES):
+					self._exportVertices()
+					if self.vertices: self.output['vertices'] = self.vertices
+					print '✓     Vertices exported'
 
-		# Bones
-		self.bonesOn = self.dialog.GetBool(ids.BONES)
-		if self.bonesOn:
-			bonesGUID = self.dialog.armatures[self.dialog.GetInt32(ids.BONESELECT)]
-			for obj in self.doc.GetObjects():
-				if obj.GetGUID() == bonesGUID:
-					self.armature = obj
+				if self.dialog.GetBool(ids.NORMALSFACE):
+					self._exportFaceNormals()
+					if self.normals: self.output['normals'] = self.normals
+					print '✓     Face normals exported'
 
-			if self.armature:
-				typeId = 1019362 # Joint
-				self.allJoints = []
-				FindObjects(self.armature, typeId, self.allJoints)
-				self._exportBones()
-				if self.bones: self.output['bones'] = self.bones
-				print '✓     Bones exported'
+				if self.dialog.GetBool(ids.NORMALSVERTEX):
+					self._exportVertexNormals()
+					if self.normals: self.output['normals'] = self.normals
+					print '✓     Vertex normals exported'
 
-		# Weights
-		if self.dialog.GetBool(ids.WEIGHTS):
-			if dialog.weighttag:
-				self.influences = self.dialog.GetInt32(ids.INFLUENCES)
-				self._exportWeights(dialog.weighttag, self.influences)
-				if self.influences: self.output['influencesPerVertex'] = self.influences
-				if self.skinIndices: self.output['skinIndices'] = self.skinIndices
-				if self.skinWeights: self.output['skinWeights'] = self.skinWeights
-				print '✓     Weights exported'
+				if self.dialog.GetBool(ids.UVS):
+					if dialog.uvtag:
+						self._exportFaceVertexUVs(dialog.uvtag)
+						if self.uvs: self.output['uvs'] = [self.uvs]
+						print '✓     UVs exported'
 
-		# Animations
-		if self.dialog.GetBool(ids.SKANIM) and self.armature:
+				if self.dialog.GetBool(ids.FACES):
+					self._exportFaces()
+					if self.faces: self.output['faces'] = self.faces
+					print "✓     Faces exported"
 
-			# Save current min max values for timeline
-			oldMinTime = self.doc.GetMinTime()
-			oldMaxTime = self.doc.GetMaxTime()
-			oldLoopMinTime = self.doc.GetLoopMinTime()
-			oldLoopMaxTime = self.doc.GetLoopMaxTime()
+				# Bones
+				self.bonesOn = self.dialog.GetBool(ids.BONES)
+				if self.bonesOn:
+					bonesGUID = self.dialog.armatures[self.dialog.GetInt32(ids.BONESELECT)]
+					for obj in self.doc.GetObjects():
+						if obj.GetGUID() == bonesGUID:
+							self.bones = obj
 
-			# Set the timeline from dialog values
-			minFrame = self.dialog.GetInt32(ids.MINFRAME)
-			maxFrame = self.dialog.GetInt32(ids.MAXFRAME)
-			minTime = c4d.BaseTime(minFrame, self.fps)
-			maxTime = c4d.BaseTime(maxFrame, self.fps)
+					if self.bones:
+						typeId = 1019362 # Joint
+						self.allJoints = []
+						FindObjects(self.bones, typeId, self.allJoints)
+						self._exportBones()
+						if self.bones: self.output['bones'] = self.bones
+						print '✓     Bones exported'
 
-			self.doc.SetMinTime(minTime)
-			self.doc.SetMaxTime(maxTime)
-			self.doc.SetLoopMinTime(minTime)
-			self.doc.SetLoopMaxTime(maxTime)
+				# Weights
+				if self.dialog.GetBool(ids.WEIGHTS):
+					if dialog.weighttag:
+						self.influences = self.dialog.GetInt32(ids.INFLUENCES)
+						self._exportWeights(dialog.weighttag, self.influences)
+						if self.influences: self.output['influencesPerVertex'] = self.influences
+						if self.skinIndices: self.output['skinIndices'] = self.skinIndices
+						if self.skinWeights: self.output['skinWeights'] = self.skinWeights
+						print '✓     Weights exported'
 
-			# Update time values
-			self.minTime = self.doc.GetMinTime()
-			self.maxTime = self.doc.GetMaxTime()
-			self.firstFrame = self.minTime.GetFrame(self.fps)
-			self.lastFrame = self.maxTime.GetFrame(self.fps)
-			self._goToFrame(self.firstFrame)
+				# Animations
+				if self.dialog.GetBool(ids.SKANIM) and self.bones:
 
-			# Build animation data
-			self._buildJointKeyframeSummary()
-			self._exportKeyframeAnimations()
-			if self.animations: self.output['animations'] = self.animations
+					# Save current min max values for timeline
+					oldMinTime = self.doc.GetMinTime()
+					oldMaxTime = self.doc.GetMaxTime()
+					oldLoopMinTime = self.doc.GetLoopMinTime()
+					oldLoopMaxTime = self.doc.GetLoopMaxTime()
 
-			# Return original values
-			self.doc.SetLoopMinTime(oldLoopMinTime)
-			self.doc.SetLoopMaxTime(oldLoopMaxTime)
-			self.doc.SetMinTime(oldMinTime)
-			self.doc.SetMaxTime(oldMaxTime)
+					# Set the timeline from dialog values
+					minFrame = self.dialog.GetInt32(ids.MINFRAME)
+					maxFrame = self.dialog.GetInt32(ids.MAXFRAME)
+					minTime = c4d.BaseTime(minFrame, self.fps)
+					maxTime = c4d.BaseTime(maxFrame, self.fps)
 
-			print '✓     Exported keyframe animations'
+					self.doc.SetMinTime(minTime)
+					self.doc.SetMaxTime(maxTime)
+					self.doc.SetLoopMinTime(minTime)
+					self.doc.SetLoopMaxTime(maxTime)
+
+					# Update time values
+					self.minTime = self.doc.GetMinTime()
+					self.maxTime = self.doc.GetMaxTime()
+					self.firstFrame = self.minTime.GetFrame(self.fps)
+					self.lastFrame = self.maxTime.GetFrame(self.fps)
+					self._goToFrame(self.firstFrame)
+
+					# Build animation data
+					self._buildJointKeyframeSummary()
+					self._exportKeyframeAnimations()
+					if self.animations: self.output['animations'] = self.animations
+
+					# Return original values
+					self.doc.SetLoopMinTime(oldLoopMinTime)
+					self.doc.SetLoopMaxTime(oldLoopMaxTime)
+					self.doc.SetMinTime(oldMinTime)
+					self.doc.SetMaxTime(oldMaxTime)
+					print '✓     Exported keyframe animations'
+
+		writer.write(self.dialog.path)
 
 		# Save
-		print '\nSaving to: ', self.dialog.path
-		with file(self.dialog.path, 'w') as f:
-			if self.dialog.GetBool(ids.PRETTY):
-				f.write(json.dumps(self.output, indent=4, separators=(',', ': ')))
-			else:
-				f.write(json.dumps(self.output, separators=(",",":")))
+		# print '\nSaving to: ', self.dialog.path
+		# with file(self.dialog.path, 'w') as f:
+		# 	if self.dialog.GetBool(ids.PRETTY):
+		# 		f.write(json.dumps(self.output, indent=4, separators=(',', ': ')))
+		# 	else:
+		# 		f.write(json.dumps(self.output, separators=(",",":")))
 
 		# Return to original frame
 		self._goToFrame(self.currentFrame)
@@ -224,12 +309,12 @@ class ThreeJsWriter(object):
 	"""
 
 	def _exportVertices(self):
-		for vector in self.mesh.GetAllPoints():
+		for v in self.mesh.GetAllPoints():
 			if self.dialog.GetInt32(ids.REFERENCESELECT) == ids.GLOBAL:
-				vector = LocalToGlobal(self.mesh, vector)
-			self.vertices += [round(vector.x, self.floatPrecision) * self.flip['x']]
-			self.vertices += [round(vector.y, self.floatPrecision) * self.flip['y']]
-			self.vertices += [round(vector.z, self.floatPrecision) * self.flip['z']]
+				v = LocalToGlobal(self.mesh, v)
+			self.vertices += [round(v.x, self.floatPrecision) * self.flip['x']]
+			self.vertices += [round(v.y, self.floatPrecision) * self.flip['y']]
+			self.vertices += [round(v.z, self.floatPrecision) * self.flip['z']]
 
 	def _exportFaceNormals(self):
 		for p in self.mesh.GetAllPolygons():

@@ -4,7 +4,7 @@ import c4d
 
 from c4d import documents
 from logic import ids
-from logic import exporter
+from logic import exporter as exporter
 
 class MainDialog(c4d.gui.GeDialog):
 
@@ -21,7 +21,7 @@ class MainDialog(c4d.gui.GeDialog):
 
 		self.uvtag = None
 		self.weighttag = None
-		self.armatures = {}
+		self.bones = {}
 		self.doc = documents.GetActiveDocument()
 		self.op  = self.doc.GetActiveObject()
 		self.name = self.op.GetName()
@@ -45,7 +45,7 @@ class MainDialog(c4d.gui.GeDialog):
 		# find bones
 		for i, obj in enumerate(self.doc.GetObjects()):
 			if obj.GetType() == 1019362: # Joint
-				self.armatures[i] = obj.GetGUID()
+				self.bones[i] = obj.GetGUID()
 				self.AddChild(ids.BONESELECT, i, obj.GetName())
 
 		# find UV and Weight tag
@@ -88,7 +88,7 @@ class MainDialog(c4d.gui.GeDialog):
 		self.SetBool(ids.MARKERS, True)
 
 		# disable animations if no bones found
-		if not self.armatures:
+		if not self.bones:
 			self.ToggleAnimation(False)
 			print '?     Warning: Joints not found'
 
@@ -214,13 +214,14 @@ class MainDialog(c4d.gui.GeDialog):
 			self.folder = self.doc.GetDocumentPath()
 
 			if self.GetBool(ids.DESTINATION) == True or self.folder == '':
-				self.path = c4d.storage.LoadDialog(title="Save File for JSON Export", flags=c4d.FILESELECT_SAVE, force_suffix="json")
+				self.path = c4d.storage.LoadDialog(title="Save File for JSON Export", flags=c4d.FILESELECT_SAVE, force_suffix="b3d")
 				if self.path == None:
-					c4d.gui.MessageDialog('Canceled: 	✘ Please specify an output folder')
+					c4d.gui.MessageDialog('Canceled: 	✘ Please specify an output file')
 					return False
 			else:
 				self.path = self.folder + '/' + self.name + '.json'
 
+			reload(exporter)
 			writer = exporter.ThreeJsWriter()
 			writer.write(self)
 
